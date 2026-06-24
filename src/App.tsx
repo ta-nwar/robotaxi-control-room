@@ -279,6 +279,14 @@ function backendWebSocketUrl(path: string) {
   return `${protocolUrl}${path}`
 }
 
+function backendHttpUrl(path: string) {
+  if (!scenarioApiUrl) {
+    return null
+  }
+
+  return `${scenarioApiUrl.replace(/\/$/, "")}${path}`
+}
+
 export default function App() {
   const [scenario, setScenario] = useState<Scenario | null>(null)
   const [loadError, setLoadError] = useState<string | null>(null)
@@ -704,68 +712,101 @@ export default function App() {
     }
 
     const wsUrl = backendWebSocketUrl("/ws/sumo/reinickendorf")
+    const summaryUrl = backendHttpUrl("/sumo/reinickendorf/summary")
     if (!wsUrl) {
       setSumoStatus("Local bundle only")
       return
     }
 
+    const nextWsUrl = wsUrl
     let isClosed = false
-    const socket = new WebSocket(wsUrl)
-    setSumoStatus("Connecting")
+    let socket: WebSocket | null = null
+    setSumoStatus("Checking backend")
 
-    socket.addEventListener("open", () => {
-      if (!isClosed) {
-        setSumoStatus("Starting SUMO")
-      }
-    })
-
-    socket.addEventListener("message", (event) => {
-      const message = JSON.parse(event.data as string) as
-        | { type: "hello" }
-        | ({ type: "frame" } & SumoFrame)
-        | { type: "done" }
-        | { type: "error"; message: string }
-
-      if (message.type === "hello") {
-        setSumoStatus("SUMO running")
+    async function connectToSumo() {
+      if (!summaryUrl) {
+        setSumoStatus("Backend not configured")
         return
       }
 
-      if (message.type === "frame") {
-        setSumoFrame({
-          simSec: message.simSec,
-          vehicleCount: message.vehicleCount,
-          vehicles: message.vehicles,
-          departed: message.departed,
-          arrived: message.arrived,
-        })
-        setSumoStatus("Streaming")
+      try {
+        const response = await fetch(summaryUrl)
+        if (!response.ok) {
+          setSumoStatus(
+            response.status === 404
+              ? "HF Space needs redeploy"
+              : `Backend check failed ${response.status}`,
+          )
+          return
+        }
+      } catch {
+        setSumoStatus("Backend unavailable")
         return
       }
 
-      if (message.type === "done") {
-        setSumoStatus("Complete")
+      if (isClosed) {
         return
       }
 
-      if (message.type === "error") {
-        setSumoStatus(message.message)
-      }
-    })
+      socket = new WebSocket(nextWsUrl)
+      setSumoStatus("Connecting")
 
-    socket.addEventListener("close", () => {
-      if (!isClosed) {
-        setSumoStatus("Disconnected")
-      }
-    })
+      socket.addEventListener("open", () => {
+        if (!isClosed) {
+          setSumoStatus("Starting SUMO")
+        }
+      })
 
-    socket.addEventListener("error", () => {
-      setSumoStatus("Connection error")
-    })
+      socket.addEventListener("message", (event) => {
+        const message = JSON.parse(event.data as string) as
+          | { type: "hello" }
+          | ({ type: "frame" } & SumoFrame)
+          | { type: "done" }
+          | { type: "error"; message: string }
+
+        if (message.type === "hello") {
+          setSumoStatus("SUMO running")
+          return
+        }
+
+        if (message.type === "frame") {
+          setSumoFrame({
+            simSec: message.simSec,
+            vehicleCount: message.vehicleCount,
+            vehicles: message.vehicles,
+            departed: message.departed,
+            arrived: message.arrived,
+          })
+          setSumoStatus("Streaming")
+          return
+        }
+
+        if (message.type === "done") {
+          setSumoStatus("Complete")
+          return
+        }
+
+        if (message.type === "error") {
+          setSumoStatus(message.message)
+        }
+      })
+
+      socket.addEventListener("close", () => {
+        if (!isClosed) {
+          setSumoStatus("Disconnected")
+        }
+      })
+
+      socket.addEventListener("error", () => {
+        setSumoStatus("Connection error")
+      })
+    }
+
+    void connectToSumo()
 
     return () => {
       isClosed = true
-      socket.close()
+      socket?.close()
     }
   }, [activeSection, sumoSessionKey])
 
