@@ -1,9 +1,12 @@
 import asyncio
 import json
+import math
 import os
+import re
 import shutil
 import subprocess
 import sys
+import xml.etree.ElementTree as ET
 from pathlib import Path
 from functools import lru_cache
 from typing import Any
@@ -140,20 +143,24 @@ def packaged_sumo_files() -> dict[str, bool]:
 
 @lru_cache(maxsize=1)
 def load_sumo_network() -> dict[str, Any]:
-    ensure_sumo_tools()
-    import sumolib  # type: ignore[import-not-found]
+    tree = ET.parse(SUMO_NET_PATH)
+    root = tree.getroot()
+    location = root.find("location")
+    if location is None:
+        raise ValueError("SUMO network location metadata is missing.")
 
-    net = sumolib.net.readNet(str(SUMO_NET_PATH), withPrograms=True)
+    net_offset = parse_pair(location.attrib["netOffset"])
+    zone_match = re.search(r"\+zone=(\d+)", location.attrib.get("projParameter", ""))
+    utm_zone = int(zone_match.group(1)) if zone_match else 33
+
     lane_features = []
-    for edge in net.getEdges():
-        if edge.isSpecial():
+    for edge in root.findall("edge"):
+        edge_id = edge.attrib.get("id", "")
+        if edge.attrib.get("function") == "internal" or edge_id.startswith(":"):
             continue
 
-        for lane in edge.getLanes():
-            shape = [
-                list(net.convertXY2LonLat(point[0], point[1]))
-                for point in lane.getShape()
-            ]
+        for lane in edge.findall("lane"):
+            shape = parse_sumo_shape(lane.attrib.get("shape", ""), net_offset, utm_zone)
             if len(shape) < 2:
                 continue
 
@@ -161,28 +168,33 @@ def load_sumo_network() -> dict[str, Any]:
                 {
                     "type": "Feature",
                     "properties": {
-                        "id": lane.getID(),
-                        "edgeId": edge.getID(),
-                        "speed": round(float(lane.getSpeed()), 3),
-                        "length": round(float(lane.getLength()), 3),
+                        "id": lane.attrib.get("id"),
+                        "edgeId": edge_id,
+                        "speed": round(float(lane.attrib.get("speed", 0)), 3),
+                        "length": round(float(lane.attrib.get("length", 0)), 3),
                     },
                     "geometry": {"type": "LineString", "coordinates": shape},
                 }
             )
 
     traffic_light_features = []
-    for node in net.getNodes():
-        if node.getType() != "traffic_light":
+    for junction in root.findall("junction"):
+        if junction.attrib.get("type") != "traffic_light":
             continue
 
-        x, y = node.getCoord()
+        lon, lat = sumo_xy_to_lonlat(
+            float(junction.attrib["x"]),
+            float(junction.attrib["y"]),
+            net_offset,
+            utm_zone,
+        )
         traffic_light_features.append(
             {
                 "type": "Feature",
-                "properties": {"id": node.getID()},
+                "properties": {"id": junction.attrib.get("id")},
                 "geometry": {
                     "type": "Point",
-                    "coordinates": list(net.convertXY2LonLat(x, y)),
+                    "coordinates": [lon, lat],
                 },
             }
         )
@@ -198,6 +210,106 @@ def load_sumo_network() -> dict[str, Any]:
             "trafficLights": len(traffic_light_features),
         },
     }
+
+
+def parse_pair(value: str) -> tuple[float, float]:
+    first, second = value.split(",", maxsplit=1)
+    return float(first), float(second)
+
+
+def parse_sumo_shape(
+    shape: str,
+    net_offset: tuple[float, float],
+    utm_zone: int,
+) -> list[list[float]]:
+    coordinates = []
+    for point in shape.split():
+        x, y = parse_pair(point)
+        lon, lat = sumo_xy_to_lonlat(x, y, net_offset, utm_zone)
+        coordinates.append([lon, lat])
+    return coordinates
+
+
+def sumo_xy_to_lonlat(
+    x: float,
+    y: float,
+    net_offset: tuple[float, float],
+    utm_zone: int,
+) -> tuple[float, float]:
+    easting = x - net_offset[0]
+    northing = y - net_offset[1]
+    return utm_to_lonlat(easting, northing, utm_zone)
+
+
+def utm_to_lonlat(easting: float, northing: float, zone: int) -> tuple[float, float]:
+    # WGS84 UTM inverse projection. This avoids a heavyweight pyproj dependency
+    # for one fixed SUMO network while matching sumolib's conversion closely.
+    semi_major = 6_378_137.0
+    flattening = 1 / 298.257223563
+    scale_factor = 0.9996
+    eccentricity = math.sqrt(flattening * (2 - flattening))
+    eccentricity_prime_sq = eccentricity**2 / (1 - eccentricity**2)
+
+    x = easting - 500_000.0
+    central_meridian = math.radians((zone - 1) * 6 - 180 + 3)
+    meridional_arc = northing / scale_factor
+    mu = meridional_arc / (
+        semi_major
+        * (
+            1
+            - eccentricity**2 / 4
+            - 3 * eccentricity**4 / 64
+            - 5 * eccentricity**6 / 256
+        )
+    )
+
+    e1 = (1 - math.sqrt(1 - eccentricity**2)) / (
+        1 + math.sqrt(1 - eccentricity**2)
+    )
+    footpoint_lat = (
+        mu
+        + (3 * e1 / 2 - 27 * e1**3 / 32) * math.sin(2 * mu)
+        + (21 * e1**2 / 16 - 55 * e1**4 / 32) * math.sin(4 * mu)
+        + (151 * e1**3 / 96) * math.sin(6 * mu)
+        + (1097 * e1**4 / 512) * math.sin(8 * mu)
+    )
+
+    sin_lat = math.sin(footpoint_lat)
+    cos_lat = math.cos(footpoint_lat)
+    tan_lat = math.tan(footpoint_lat)
+    c1 = eccentricity_prime_sq * cos_lat**2
+    t1 = tan_lat**2
+    radius_curvature = semi_major * (1 - eccentricity**2) / (
+        (1 - eccentricity**2 * sin_lat**2) ** 1.5
+    )
+    prime_vertical = semi_major / math.sqrt(1 - eccentricity**2 * sin_lat**2)
+    d = x / (prime_vertical * scale_factor)
+
+    latitude = footpoint_lat - (prime_vertical * tan_lat / radius_curvature) * (
+        d**2 / 2
+        - (5 + 3 * t1 + 10 * c1 - 4 * c1**2 - 9 * eccentricity_prime_sq)
+        * d**4
+        / 24
+        + (
+            61
+            + 90 * t1
+            + 298 * c1
+            + 45 * t1**2
+            - 252 * eccentricity_prime_sq
+            - 3 * c1**2
+        )
+        * d**6
+        / 720
+    )
+    longitude = central_meridian + (
+        d
+        - (1 + 2 * t1 + c1) * d**3 / 6
+        + (5 - 2 * c1 + 28 * t1 - 3 * c1**2 + 8 * eccentricity_prime_sq + 24 * t1**2)
+        * d**5
+        / 120
+    ) / cos_lat
+
+    return math.degrees(longitude), math.degrees(latitude)
 
 
 @app.get("/scenario/summary")
