@@ -178,7 +178,8 @@ def open_text(path, mode):
 
 
 def write_strict_contained_routes(source_routes, output_path, valid_edges):
-    raw_path = output_path.with_suffix("")
+    should_gzip = str(output_path).endswith(".gz")
+    raw_path = output_path.with_suffix("") if should_gzip else output_path
     total = 0
     kept = 0
     rejected = 0
@@ -222,7 +223,8 @@ def write_strict_contained_routes(source_routes, output_path, valid_edges):
 
         out.write("</routes>\n")
 
-    gzip_if_needed(raw_path)
+    if should_gzip:
+        gzip_if_needed(raw_path)
     return {"totalVehicles": total, "keptVehicles": kept, "rejectedVehicles": rejected}
 
 
@@ -310,7 +312,7 @@ def main():
         },
         "outputs": {
             "net": str((args.out_dir / "reinickendorf-district.net.xml").resolve()),
-            "routes": str((args.out_dir / "reinickendorf-district-contained.rou.xml.gz").resolve()),
+            "routes": str((args.out_dir / "reinickendorf-district-contained.rou.xml").resolve()),
             "config": str((args.out_dir / "reinickendorf-district.sumocfg").resolve()),
         },
     }
@@ -336,7 +338,7 @@ def main():
     )
 
     route_raw_path = args.out_dir / "reinickendorf-district-contained.rou.xml"
-    route_path = Path(f"{route_raw_path}.gz")
+    route_path = route_raw_path
     route_stats = None
     if not args.skip_routes:
         if args.route_mode == "touching-cutroutes":

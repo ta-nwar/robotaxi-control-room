@@ -15,7 +15,7 @@ Files:
 
 - `reinickendorf-district.net.xml`
   - SUMO network for the official district cutout.
-- `reinickendorf-district-contained.rou.xml.gz`
+- `reinickendorf-district-contained.rou.xml`
   - Strict-contained vehicle routes. A route is included only if the full
     original edge sequence is inside the cutout network.
 - `reinickendorf-district.sumocfg`

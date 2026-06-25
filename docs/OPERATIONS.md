@@ -82,7 +82,7 @@ The active backend package includes only:
 
 ```text
 hf-space/app/sumo/reinickendorf-district/reinickendorf-district.net.xml
-hf-space/app/sumo/reinickendorf-district/reinickendorf-district-contained.rou.xml.gz
+hf-space/app/sumo/reinickendorf-district/reinickendorf-district-contained.rou.xml
 hf-space/app/sumo/reinickendorf-district/reinickendorf-district.sumocfg
 hf-space/app/sumo/reinickendorf-district/reinickendorf-district.geojson
 ```

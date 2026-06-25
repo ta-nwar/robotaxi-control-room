@@ -6,6 +6,7 @@ import re
 import shutil
 import subprocess
 import sys
+import threading
 import time
 import xml.etree.ElementTree as ET
 from pathlib import Path
@@ -24,6 +25,11 @@ SUMO_WINDOW_LABEL = "06:00-07:00"
 DEFAULT_SUMO_DELAY_MS = 0
 MAX_SUMO_DELAY_MS = 1000
 FAST_SIM_BURST_STEPS = 500
+PLAYBACK_SCOPE = "reinickendorf-district"
+PLAYBACK_DATA_FPS = 50
+PLAYBACK_DEFAULT_RATE = 10
+PLAYBACK_SPEEDS = {5, 10, 25, 50, 100, 250}
+PLAYBACK_CHUNK_SIM_SECONDS = 10
 
 SUMO_SCENARIOS: dict[str, dict[str, Any]] = {
     "reinickendorf-district": {
@@ -32,7 +38,7 @@ SUMO_SCENARIOS: dict[str, dict[str, Any]] = {
         "dir": SUMO_DISTRICT_SCENARIO_DIR,
         "config": SUMO_DISTRICT_SCENARIO_DIR / "reinickendorf-district.sumocfg",
         "net": SUMO_DISTRICT_SCENARIO_DIR / "reinickendorf-district.net.xml",
-        "route": SUMO_DISTRICT_SCENARIO_DIR / "reinickendorf-district-contained.rou.xml.gz",
+        "route": SUMO_DISTRICT_SCENARIO_DIR / "reinickendorf-district-contained.rou.xml",
         "boundary": SUMO_DISTRICT_SCENARIO_DIR / "reinickendorf-district.geojson",
         "depotEdge": None,
         "startSec": SUMO_START_SEC,
@@ -63,6 +69,15 @@ def get_sumo_scenario(key: str | None) -> dict[str, Any]:
             detail=f"Unknown SUMO scope '{scenario_key}'. Known scopes: {known_scopes}",
         )
     return SUMO_SCENARIOS[scenario_key]
+
+
+def parse_playback_rate(websocket: WebSocket) -> int:
+    raw_speed = websocket.query_params.get("speed")
+    try:
+        speed = int(raw_speed) if raw_speed is not None else PLAYBACK_DEFAULT_RATE
+    except (TypeError, ValueError):
+        return PLAYBACK_DEFAULT_RATE
+    return speed if speed in PLAYBACK_SPEEDS else PLAYBACK_DEFAULT_RATE
 
 
 def find_sumo_home() -> Path | None:
@@ -178,6 +193,20 @@ def load_geojson(path_value: str | None) -> dict[str, Any] | None:
         return json.load(handle)
 
 
+@lru_cache(maxsize=8)
+def load_sumo_projection(net_path_value: str | None) -> tuple[tuple[float, float], int]:
+    net_path = Path(net_path_value) if net_path_value else get_sumo_scenario(None)["net"]
+    root = ET.parse(net_path).getroot()
+    location = root.find("location")
+    if location is None:
+        raise ValueError("SUMO network location metadata is missing.")
+
+    net_offset = parse_pair(location.attrib["netOffset"])
+    zone_match = re.search(r"\+zone=(\d+)", location.attrib.get("projParameter", ""))
+    utm_zone = int(zone_match.group(1)) if zone_match else 33
+    return net_offset, utm_zone
+
+
 @lru_cache(maxsize=4)
 def load_sumo_network(
     net_path_value: str | None = None,
@@ -192,9 +221,7 @@ def load_sumo_network(
     if location is None:
         raise ValueError("SUMO network location metadata is missing.")
 
-    net_offset = parse_pair(location.attrib["netOffset"])
-    zone_match = re.search(r"\+zone=(\d+)", location.attrib.get("projParameter", ""))
-    utm_zone = int(zone_match.group(1)) if zone_match else 33
+    net_offset, utm_zone = load_sumo_projection(str(net_path))
 
     lane_features = []
     internal_lane_features = []
@@ -628,6 +655,10 @@ def validate_sumo_scope(scope: str) -> dict[str, Any]:
         "1",
         "--no-step-log",
         "true",
+        "--no-warnings",
+        "true",
+        "--duration-log.disable",
+        "true",
         "--quit-on-end",
         "true",
     ]
@@ -647,6 +678,186 @@ def validate_sumo_scope(scope: str) -> dict[str, Any]:
         "stdout": result.stdout[-4000:],
         "stderr": result.stderr[-4000:],
     }
+
+
+@app.get("/sumo/{scope}/playback")
+def sumo_playback(scope: str) -> dict[str, Any]:
+    selected = get_sumo_scenario(scope)
+    return {
+        "available": selected["key"] == PLAYBACK_SCOPE
+        and selected["config"].exists()
+        and find_sumo_binary() is not None,
+        "backend": "sumo-traci-playback",
+        "scope": selected["key"],
+        "window": {
+            "startSec": selected["startSec"],
+            "endSec": selected["endSec"],
+            "label": SUMO_WINDOW_LABEL,
+        },
+        "playbackRate": PLAYBACK_DEFAULT_RATE,
+        "dataFps": PLAYBACK_DATA_FPS,
+        "availablePlaybackRates": sorted(PLAYBACK_SPEEDS),
+        "chunkSimSeconds": PLAYBACK_CHUNK_SIM_SECONDS,
+        "frameStepSec": PLAYBACK_DEFAULT_RATE / PLAYBACK_DATA_FPS,
+        "websocket": f"/ws/sumo/{selected['key']}/playback",
+        "frameShape": {
+            "simSec": "number",
+            "vehicles": [{"id": "string", "lon": "number", "lat": "number", "angle": "number"}],
+            "trafficLights": {"trafficLightId": "state"},
+        },
+    }
+
+
+@app.websocket("/ws/sumo/{scope}/playback")
+async def sumo_scope_playback(websocket: WebSocket, scope: str) -> None:
+    await websocket.accept()
+
+    try:
+        selected = get_sumo_scenario(scope)
+    except HTTPException as error:
+        await websocket.send_json({"type": "error", "message": error.detail})
+        await websocket.close()
+        return
+
+    if selected["key"] != PLAYBACK_SCOPE:
+        await websocket.send_json(
+            {
+                "type": "error",
+                "message": f"Playback recording is only available for {PLAYBACK_SCOPE}.",
+            }
+        )
+        await websocket.close()
+        return
+
+    sumo_binary = find_sumo_binary()
+    if not sumo_binary or not selected["config"].exists():
+        await websocket.send_json(
+            {
+                "type": "error",
+                "message": f"SUMO binary or {selected['label']} config is unavailable.",
+                "sumoAvailable": bool(sumo_binary),
+                "configExists": selected["config"].exists(),
+            }
+        )
+        await websocket.close()
+        return
+
+    try:
+        traci = ensure_traci_import()
+    except Exception as error:  # pragma: no cover - runtime environment dependent
+        await websocket.send_json({"type": "error", "message": f"TraCI import failed: {error}"})
+        await websocket.close()
+        return
+
+    playback_rate = parse_playback_rate(websocket)
+    frame_step_sec = playback_rate / PLAYBACK_DATA_FPS
+
+    command = [
+        sumo_binary,
+        "-c",
+        str(selected["config"]),
+        "--begin",
+        str(selected["startSec"]),
+        "--end",
+        str(selected["endSec"]),
+        "--step-length",
+        str(frame_step_sec),
+        "--no-step-log",
+        "true",
+        "--quit-on-end",
+        "true",
+    ]
+
+    sumo_home = find_sumo_home()
+    if sumo_home:
+        os.environ["SUMO_HOME"] = str(sumo_home)
+
+    stop_event = threading.Event()
+    message_queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+    event_loop = asyncio.get_running_loop()
+    connection_label = f"{selected['key']}-playback-{id(websocket)}"
+    command_task: asyncio.Task[None] | None = None
+    worker_task: asyncio.Task[None] | None = None
+
+    await websocket.send_json(
+        {
+            "type": "hello",
+            "backend": "sumo-traci-playback",
+            "scope": selected["key"],
+            "window": {"startSec": selected["startSec"], "endSec": selected["endSec"]},
+            "playbackRate": playback_rate,
+            "dataFps": PLAYBACK_DATA_FPS,
+            "chunkSimSeconds": PLAYBACK_CHUNK_SIM_SECONDS,
+            "frameStepSec": frame_step_sec,
+            "commands": ["stop"],
+        }
+    )
+
+    async def receive_commands() -> None:
+        try:
+            while True:
+                payload = await websocket.receive_json()
+                command_name = str(payload.get("command") or payload.get("type") or "").lower()
+                if command_name in {"stop", "close"}:
+                    stop_event.set()
+                    return
+        except WebSocketDisconnect:
+            stop_event.set()
+
+    try:
+        command_task = asyncio.create_task(receive_commands())
+        worker_task = asyncio.create_task(
+            asyncio.to_thread(
+                produce_sumo_playback_chunks,
+                traci,
+                command,
+                connection_label,
+                selected,
+                playback_rate,
+                frame_step_sec,
+                message_queue,
+                event_loop,
+                stop_event,
+            )
+        )
+
+        while True:
+            if command_task.done():
+                command_error = command_task.exception()
+                if command_error and not isinstance(command_error, WebSocketDisconnect):
+                    raise command_error
+
+            payload = await message_queue.get()
+            send_started_at = time.perf_counter()
+            await websocket.send_json(payload)
+            if payload.get("type") == "chunk":
+                await websocket.send_json(
+                    {
+                        "type": "transportProfile",
+                        "chunkIndex": payload.get("chunkIndex"),
+                        "sendMs": round((time.perf_counter() - send_started_at) * 1000, 2),
+                    }
+                )
+            if payload.get("type") in {"done", "error", "stopped"}:
+                break
+    except WebSocketDisconnect:
+        stop_event.set()
+    except Exception as error:
+        stop_event.set()
+        await websocket.send_json({"type": "error", "message": str(error)})
+    finally:
+        stop_event.set()
+        if command_task and not command_task.done():
+            command_task.cancel()
+            try:
+                await command_task
+            except asyncio.CancelledError:
+                pass
+        if worker_task:
+            try:
+                await worker_task
+            except Exception:
+                pass
 
 
 @app.websocket("/ws/sumo/{scope}")
@@ -673,13 +884,6 @@ async def sumo_scope(websocket: WebSocket, scope: str) -> None:
         await websocket.close()
         return
 
-    try:
-        traci = ensure_traci_import()
-    except Exception as error:  # pragma: no cover - runtime environment dependent
-        await websocket.send_json({"type": "error", "message": f"TraCI import failed: {error}"})
-        await websocket.close()
-        return
-
     command = [
         sumo_binary,
         "-c",
@@ -692,16 +896,31 @@ async def sumo_scope(websocket: WebSocket, scope: str) -> None:
         "1",
         "--no-step-log",
         "true",
+        "--duration-log.disable",
+        "true",
+        "--no-warnings",
+        "true",
+        "--log",
+        "",
+        "--summary-output",
+        "",
+        "--statistic-output",
+        "",
+        "--output-prefix",
+        "",
         "--quit-on-end",
         "true",
     ]
 
-    connection_label = f"{selected['key']}-{id(websocket)}"
     command_task: asyncio.Task[None] | None = None
+    run_task: asyncio.Task[None] | None = None
     command_queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
     delay_ms = parse_delay_ms(websocket)
     is_running = False
+    last_step = 0
+    sim_process: asyncio.subprocess.Process | None = None
     run_started_at: float | None = None
+    stop_requested = False
 
     try:
         (selected["dir"] / "output").mkdir(exist_ok=True)
@@ -712,7 +931,7 @@ async def sumo_scope(websocket: WebSocket, scope: str) -> None:
         await websocket.send_json(
             {
                 "type": "hello",
-                "backend": "sumo-traci",
+                "backend": "sumo-subprocess",
                 "scope": selected["key"],
                 "window": {"startSec": selected["startSec"], "endSec": selected["endSec"]},
                 "delayMs": delay_ms,
@@ -725,29 +944,19 @@ async def sumo_scope(websocket: WebSocket, scope: str) -> None:
                 payload = await websocket.receive_json()
                 await command_queue.put(payload)
 
-        async def start_connection():
-            await asyncio.to_thread(traci.start, command, label=connection_label)
-            return traci.getConnection(connection_label)
-
-        async def close_connection() -> None:
-            try:
-                traci.switch(connection_label)
-                traci.close(False)
-            except Exception:
-                pass
-
-        connection = await start_connection()
         command_task = asyncio.create_task(receive_commands())
 
-        async def send_sim_status(status: str, elapsed_sec: float | None = None) -> int:
-            sim_sec = int(connection.simulation.getTime())
-            step = max(0, sim_sec - int(selected["startSec"]))
+        async def send_sim_status(
+            status: str,
+            elapsed_sec: float | None = None,
+            error: str | None = None,
+        ) -> None:
             payload: dict[str, Any] = {
                 "type": "simStatus",
                 "status": status,
-                "statusText": format_sim_status(status, elapsed_sec),
-                "simSec": sim_sec,
-                "step": step,
+                "statusText": error or format_sim_status(status, elapsed_sec),
+                "simSec": int(selected["startSec"]) + last_step,
+                "step": last_step,
                 "totalSteps": int(selected["endSec"] - selected["startSec"]),
                 "delayMs": delay_ms,
                 "running": is_running,
@@ -755,43 +964,66 @@ async def sumo_scope(websocket: WebSocket, scope: str) -> None:
             if elapsed_sec is not None:
                 payload["elapsedSec"] = round(elapsed_sec, 3)
             await websocket.send_json(payload)
-            return sim_sec
 
-        async def step_once() -> int:
-            await asyncio.to_thread(connection.simulationStep)
-            return int(connection.simulation.getTime())
+        async def run_plain_sumo() -> None:
+            nonlocal is_running, last_step, run_started_at, sim_process, stop_requested
+            is_running = True
+            stop_requested = False
+            last_step = 0
+            run_started_at = time.perf_counter()
+            await send_sim_status("running")
 
-        async def advance_fast_burst() -> int:
-            def run_burst() -> int:
-                steps = 0
-                sim_sec = int(connection.simulation.getTime())
-                while steps < FAST_SIM_BURST_STEPS and sim_sec < selected["endSec"]:
-                    connection.simulationStep()
-                    steps += 1
-                    sim_sec = int(connection.simulation.getTime())
-                return sim_sec
+            sim_process = await asyncio.create_subprocess_exec(
+                *command,
+                cwd=str(selected["dir"]),
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, stderr = await sim_process.communicate()
+            elapsed_sec = time.perf_counter() - run_started_at
+            return_code = sim_process.returncode
+            sim_process = None
+            is_running = False
 
-            return await asyncio.to_thread(run_burst)
+            if stop_requested:
+                await send_sim_status("stopped", elapsed_sec)
+                return
+
+            if return_code == 0:
+                last_step = int(selected["endSec"] - selected["startSec"])
+                await send_sim_status("finished", elapsed_sec)
+                await websocket.send_json({"type": "done", "simSec": selected["endSec"]})
+                return
+
+            output = (stderr or stdout or b"").decode("utf-8", errors="replace").strip()
+            await send_sim_status(
+                "failed",
+                elapsed_sec,
+                f"SUMO exited with code {return_code}: {output[-500:]}",
+            )
 
         async def handle_command(payload: dict[str, Any]) -> None:
-            nonlocal connection, delay_ms, is_running, run_started_at
+            nonlocal delay_ms, is_running, last_step, run_task, sim_process, stop_requested
             command_name = str(payload.get("command") or payload.get("type") or "").lower()
             if command_name == "start":
-                is_running = True
-                run_started_at = time.perf_counter()
-                await send_sim_status("running")
+                if is_running:
+                    await send_sim_status("running")
+                    return
+                run_task = asyncio.create_task(run_plain_sumo())
             elif command_name == "stop":
+                stop_requested = True
+                if sim_process and sim_process.returncode is None:
+                    sim_process.terminate()
                 is_running = False
                 await send_sim_status("stopped")
             elif command_name == "step":
-                if int(connection.simulation.getTime()) < selected["endSec"]:
-                    await step_once()
-                await send_sim_status("stepped")
+                await send_sim_status("step-unavailable")
             elif command_name == "reset":
                 is_running = False
-                await close_connection()
-                connection = await start_connection()
-                run_started_at = None
+                last_step = 0
+                stop_requested = True
+                if sim_process and sim_process.returncode is None:
+                    sim_process.terminate()
                 await send_sim_status("idle")
             elif command_name == "delay":
                 delay_ms = clamp_delay_ms(payload.get("delayMs"))
@@ -821,27 +1053,7 @@ async def sumo_scope(websocket: WebSocket, scope: str) -> None:
                 await handle_command(await command_queue.get())
                 continue
 
-            sim_sec = int(connection.simulation.getTime())
-            if sim_sec >= selected["endSec"]:
-                is_running = False
-                elapsed_sec = time.perf_counter() - run_started_at if run_started_at else None
-                await send_sim_status("finished", elapsed_sec)
-                await websocket.send_json({"type": "done", "simSec": sim_sec})
-                continue
-
-            if delay_ms > 0:
-                await step_once()
-                try:
-                    payload = await asyncio.wait_for(
-                        command_queue.get(),
-                        timeout=delay_ms / 1000,
-                    )
-                except asyncio.TimeoutError:
-                    continue
-                await handle_command(payload)
-            else:
-                await advance_fast_burst()
-                await asyncio.sleep(0)
+            await asyncio.sleep(0.05)
     except WebSocketDisconnect:
         return
     except Exception as error:
@@ -853,11 +1065,251 @@ async def sumo_scope(websocket: WebSocket, scope: str) -> None:
                 await command_task
             except asyncio.CancelledError:
                 pass
+        if run_task and not run_task.done():
+            run_task.cancel()
+        if sim_process and sim_process.returncode is None:
+            sim_process.terminate()
+
+
+def produce_sumo_playback_chunks(
+    traci: Any,
+    command: list[str],
+    connection_label: str,
+    selected: dict[str, Any],
+    playback_rate: int,
+    frame_step_sec: float,
+    message_queue: asyncio.Queue[dict[str, Any]],
+    event_loop: asyncio.AbstractEventLoop,
+    stop_event: threading.Event,
+) -> None:
+    chunk_index = 0
+    chunk_frames: list[dict[str, Any]] = []
+    recorded_frames = 0
+    started_at = time.perf_counter()
+    frames_per_chunk = max(1, int(round(PLAYBACK_CHUNK_SIM_SECONDS / frame_step_sec)))
+    chunk_started_at = time.perf_counter()
+    chunk_step_ms = 0.0
+    chunk_frame_ms = 0.0
+    chunk_vehicle_id_ms = 0.0
+    chunk_vehicle_loop_ms = 0.0
+    chunk_traffic_light_ms = 0.0
+    chunk_vehicle_count = 0
+
+    def emit(payload: dict[str, Any]) -> None:
+        future = asyncio.run_coroutine_threadsafe(message_queue.put(payload), event_loop)
+        future.result()
+
+    def emit_chunk() -> None:
+        nonlocal chunk_index, chunk_frames, recorded_frames
+        nonlocal chunk_started_at, chunk_step_ms, chunk_frame_ms, chunk_vehicle_count
+        nonlocal chunk_vehicle_id_ms, chunk_vehicle_loop_ms, chunk_traffic_light_ms
+        if not chunk_frames:
+            return
+
+        frame_count = len(chunk_frames)
+        recorded_frames += len(chunk_frames)
+        emit(
+            {
+                "type": "chunk",
+                "scope": selected["key"],
+                "chunkIndex": chunk_index,
+                "playbackRate": playback_rate,
+                "dataFps": PLAYBACK_DATA_FPS,
+                "frameStepSec": frame_step_sec,
+                "startSimSec": chunk_frames[0]["simSec"],
+                "endSimSec": chunk_frames[-1]["simSec"],
+                "frames": chunk_frames,
+                "profile": {
+                    "frames": frame_count,
+                    "vehicles": chunk_vehicle_count,
+                    "stepMs": round(chunk_step_ms, 2),
+                    "frameMs": round(chunk_frame_ms, 2),
+                    "vehicleIdMs": round(chunk_vehicle_id_ms, 2),
+                    "vehicleLoopMs": round(chunk_vehicle_loop_ms, 2),
+                    "trafficLightMs": round(chunk_traffic_light_ms, 2),
+                    "chunkMs": round((time.perf_counter() - chunk_started_at) * 1000, 2),
+                },
+            }
+        )
+        chunk_index += 1
+        chunk_frames = []
+        chunk_started_at = time.perf_counter()
+        chunk_step_ms = 0.0
+        chunk_frame_ms = 0.0
+        chunk_vehicle_id_ms = 0.0
+        chunk_vehicle_loop_ms = 0.0
+        chunk_traffic_light_ms = 0.0
+        chunk_vehicle_count = 0
+
+    try:
+        traci.start(command, label=connection_label)
+        connection = traci.getConnection(connection_label)
+        traci_constants = traci.constants
+        net_offset, utm_zone = load_sumo_projection(str(selected["net"]))
+        traffic_light_ids = list(connection.trafficlight.getIDList())
+        for traffic_light_id in traffic_light_ids:
+            connection.trafficlight.subscribe(
+                traffic_light_id,
+                [traci_constants.TL_RED_YELLOW_GREEN_STATE],
+            )
+        subscribed_vehicle_ids: set[str] = set()
+        total_steps = int(round((selected["endSec"] - selected["startSec"]) / frame_step_sec))
+
+        emit(
+            {
+                "type": "recording",
+                "status": "running",
+                "scope": selected["key"],
+                "startSimSec": selected["startSec"],
+                "endSimSec": selected["endSec"],
+                "totalSteps": total_steps,
+                "playbackRate": playback_rate,
+                "dataFps": PLAYBACK_DATA_FPS,
+                "chunkSimSeconds": PLAYBACK_CHUNK_SIM_SECONDS,
+                "frameStepSec": frame_step_sec,
+            }
+        )
+
+        while not stop_event.is_set() and float(connection.simulation.getTime()) < selected["endSec"] - 1e-9:
+            step_started_at = time.perf_counter()
+            connection.simulationStep()
+            chunk_step_ms += (time.perf_counter() - step_started_at) * 1000
+            sim_sec = round(float(connection.simulation.getTime()), 3)
+            frame_started_at = time.perf_counter()
+            frame_profile: dict[str, float] = {}
+            frame = build_compact_sumo_frame(
+                connection,
+                sim_sec,
+                traci_constants,
+                net_offset,
+                utm_zone,
+                subscribed_vehicle_ids,
+                traffic_light_ids,
+                frame_profile,
+            )
+            chunk_frame_ms += (time.perf_counter() - frame_started_at) * 1000
+            chunk_vehicle_id_ms += frame_profile.get("vehicleIdMs", 0.0)
+            chunk_vehicle_loop_ms += frame_profile.get("vehicleLoopMs", 0.0)
+            chunk_traffic_light_ms += frame_profile.get("trafficLightMs", 0.0)
+            chunk_vehicle_count += len(frame["vehicles"])
+            chunk_frames.append(frame)
+
+            if len(chunk_frames) >= frames_per_chunk or sim_sec >= selected["endSec"]:
+                emit_chunk()
+
+        emit_chunk()
+        elapsed_sec = round(time.perf_counter() - started_at, 3)
+        if stop_event.is_set():
+            emit(
+                {
+                    "type": "stopped",
+                    "scope": selected["key"],
+                    "recordedFrames": recorded_frames,
+                    "elapsedSec": elapsed_sec,
+                }
+            )
+            return
+
+        emit(
+            {
+                "type": "done",
+                "scope": selected["key"],
+                "simSec": selected["endSec"],
+                "chunks": chunk_index,
+                "recordedFrames": recorded_frames,
+                "elapsedSec": elapsed_sec,
+            }
+        )
+    except Exception as error:
+        emit({"type": "error", "message": str(error)})
+    finally:
         try:
             traci.switch(connection_label)
             traci.close(False)
         except Exception:
             pass
+
+
+def build_compact_sumo_frame(
+    connection: Any,
+    sim_sec: float,
+    traci_constants: Any,
+    net_offset: tuple[float, float],
+    utm_zone: int,
+    subscribed_vehicle_ids: set[str],
+    traffic_light_ids: list[str],
+    profile: dict[str, float],
+) -> dict[str, Any]:
+    vehicles = []
+    vehicle_id_started_at = time.perf_counter()
+    vehicle_ids = set(connection.vehicle.getIDList())
+    for vehicle_id in vehicle_ids - subscribed_vehicle_ids:
+        connection.vehicle.subscribe(
+            vehicle_id,
+            [traci_constants.VAR_POSITION, traci_constants.VAR_ANGLE],
+        )
+    subscribed_vehicle_ids.intersection_update(vehicle_ids)
+    subscribed_vehicle_ids.update(vehicle_ids)
+    profile["vehicleIdMs"] = (time.perf_counter() - vehicle_id_started_at) * 1000
+
+    vehicle_loop_started_at = time.perf_counter()
+    vehicle_results = connection.vehicle.getAllSubscriptionResults()
+    for vehicle_id in vehicle_ids:
+        vehicle_data = vehicle_results.get(vehicle_id)
+        if not vehicle_data:
+            continue
+        position = vehicle_data.get(traci_constants.VAR_POSITION)
+        if position is None:
+            continue
+        x, y = position
+        lon, lat = sumo_xy_to_lonlat(float(x), float(y), net_offset, utm_zone)
+        vehicles.append(
+            {
+                "id": vehicle_id,
+                "lon": round(float(lon), 7),
+                "lat": round(float(lat), 7),
+                "angle": round(float(vehicle_data.get(traci_constants.VAR_ANGLE, 0)), 2),
+            }
+        )
+    profile["vehicleLoopMs"] = (time.perf_counter() - vehicle_loop_started_at) * 1000
+
+    traffic_light_started_at = time.perf_counter()
+    traffic_lights = compact_traffic_light_states(
+        connection,
+        traffic_light_ids,
+        traci_constants,
+    )
+    profile["trafficLightMs"] = (time.perf_counter() - traffic_light_started_at) * 1000
+
+    return {
+        "simSec": sim_sec,
+        "vehicles": vehicles,
+        "trafficLights": traffic_lights,
+    }
+
+
+def compact_traffic_light_states(
+    connection: Any,
+    traffic_light_ids: list[str] | None = None,
+    traci_constants: Any | None = None,
+) -> dict[str, str]:
+    if traci_constants is not None:
+        results = connection.trafficlight.getAllSubscriptionResults()
+        return {
+            traffic_light_id: str(
+                results.get(traffic_light_id, {}).get(
+                    traci_constants.TL_RED_YELLOW_GREEN_STATE,
+                    "",
+                )
+            )
+            for traffic_light_id in (traffic_light_ids or results.keys())
+        }
+
+    ids = traffic_light_ids if traffic_light_ids is not None else connection.trafficlight.getIDList()
+    return {
+        traffic_light_id: connection.trafficlight.getRedYellowGreenState(traffic_light_id)
+        for traffic_light_id in ids
+    }
 
 
 def build_sumo_frame(
@@ -907,6 +1359,10 @@ def format_sim_status(status: str, elapsed_sec: float | None = None) -> str:
         return "Stopped"
     if status == "stepped":
         return "Stepped"
+    if status == "step-unavailable":
+        return "Step requires TraCI"
+    if status == "failed":
+        return "Failed"
     return "Idle"
 
 

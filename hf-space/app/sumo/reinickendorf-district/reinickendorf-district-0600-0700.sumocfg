@@ -2,7 +2,7 @@
 <configuration xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="http://sumo.dlr.de/xsd/sumoConfiguration.xsd">
     <input>
         <net-file value="reinickendorf-district.net.xml"/>
-        <route-files value="reinickendorf-district-contained.rou.xml.gz"/>
+        <route-files value="reinickendorf-district-contained.rou.xml"/>
     </input>
     <output>
         <output-prefix value="output/reinickendorf_district_0600_0700_"/>
