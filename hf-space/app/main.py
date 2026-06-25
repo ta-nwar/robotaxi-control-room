@@ -23,6 +23,8 @@ SUMO_NET_PATH = SUMO_SCENARIO_DIR / "reinickendorf.net.xml"
 SUMO_START_SEC = 21_600
 SUMO_END_SEC = 25_200
 DEFAULT_FRAME_DELAY_SEC = 0.035
+DEFAULT_SUMO_SPEED = 60.0
+MAX_WEBSOCKET_FPS = 60.0
 
 app = FastAPI(title="Robotaxi SUMO Backend", version="0.1.0")
 
@@ -156,19 +158,25 @@ def load_sumo_network() -> dict[str, Any]:
 
     lane_features = []
     internal_lane_features = []
+    lane_shapes_by_id = {}
+    lane_xy_shapes_by_id = {}
     for edge in root.findall("edge"):
         edge_id = edge.attrib.get("id", "")
         is_internal = edge.attrib.get("function") == "internal" or edge_id.startswith(":")
 
         for lane in edge.findall("lane"):
-            shape = parse_sumo_shape(lane.attrib.get("shape", ""), net_offset, utm_zone)
+            lane_id = lane.attrib.get("id", "")
+            xy_shape = parse_sumo_xy_shape(lane.attrib.get("shape", ""))
+            shape = sumo_xy_shape_to_lonlat(xy_shape, net_offset, utm_zone)
             if len(shape) < 2:
                 continue
 
+            lane_shapes_by_id[lane_id] = shape
+            lane_xy_shapes_by_id[lane_id] = xy_shape
             feature = {
                 "type": "Feature",
                 "properties": {
-                    "id": lane.attrib.get("id"),
+                    "id": lane_id,
                     "edgeId": edge_id,
                     "internal": is_internal,
                     "speed": round(float(lane.attrib.get("speed", 0)), 3),
@@ -181,6 +189,7 @@ def load_sumo_network() -> dict[str, Any]:
             else:
                 lane_features.append(feature)
 
+    traffic_light_ids_by_junction = map_traffic_light_ids_by_junction(root)
     traffic_light_features = []
     for junction in root.findall("junction"):
         if junction.attrib.get("type") != "traffic_light":
@@ -195,13 +204,99 @@ def load_sumo_network() -> dict[str, Any]:
         traffic_light_features.append(
             {
                 "type": "Feature",
-                "properties": {"id": junction.attrib.get("id")},
+                "properties": {
+                    "id": junction.attrib.get("id"),
+                    "trafficLightId": traffic_light_ids_by_junction.get(
+                        junction.attrib.get("id", ""),
+                        junction.attrib.get("id"),
+                    ),
+                },
                 "geometry": {
                     "type": "Point",
                     "coordinates": [lon, lat],
                 },
             }
         )
+
+    signal_records = []
+    for connection in root.findall("connection"):
+        traffic_light_id = connection.attrib.get("tl")
+        link_index = connection.attrib.get("linkIndex")
+        via_lane_id = connection.attrib.get("via")
+        from_edge_id = connection.attrib.get("from")
+        from_lane_index = connection.attrib.get("fromLane")
+        if (
+            not traffic_light_id
+            or link_index is None
+            or not via_lane_id
+            or not from_edge_id
+            or from_lane_index is None
+        ):
+            continue
+
+        incoming_lane_id = f"{from_edge_id}_{from_lane_index}"
+        is_incoming_lane_geometry = incoming_lane_id in lane_xy_shapes_by_id
+        xy_shape = lane_xy_shapes_by_id.get(incoming_lane_id)
+        if not xy_shape:
+            is_incoming_lane_geometry = False
+            xy_shape = lane_xy_shapes_by_id.get(via_lane_id)
+        if not xy_shape:
+            continue
+
+        signal_records.append(
+            {
+                "traffic_light_id": traffic_light_id,
+                "link_index": int(link_index),
+                "incoming_lane_id": incoming_lane_id,
+                "via_lane_id": via_lane_id,
+                "from_edge_id": from_edge_id,
+                "to_edge_id": connection.attrib.get("to"),
+                "direction": connection.attrib.get("dir"),
+                "xy_shape": xy_shape,
+                "at_end": is_incoming_lane_geometry,
+            }
+        )
+
+    signal_records_by_incoming_lane: dict[tuple[str, str], list[dict[str, Any]]] = {}
+    for record in signal_records:
+        key = (record["traffic_light_id"], record["incoming_lane_id"])
+        signal_records_by_incoming_lane.setdefault(key, []).append(record)
+
+    signal_link_features = []
+    for records in signal_records_by_incoming_lane.values():
+        records.sort(key=lambda record: record["link_index"])
+        for slot_index, record in enumerate(records):
+            slot_count = len(records)
+            signal_link_features.append(
+                {
+                    "type": "Feature",
+                    "properties": {
+                        "id": (
+                            f"{record['traffic_light_id']}:"
+                            f"{record['link_index']}:"
+                            f"{record['incoming_lane_id']}"
+                        ),
+                        "trafficLightId": record["traffic_light_id"],
+                        "linkIndex": record["link_index"],
+                        "incomingLaneId": record["incoming_lane_id"],
+                        "viaLaneId": record["via_lane_id"],
+                        "fromEdge": record["from_edge_id"],
+                        "toEdge": record["to_edge_id"],
+                        "direction": record["direction"],
+                    },
+                    "geometry": {
+                        "type": "LineString",
+                        "coordinates": signal_stop_line_coordinates(
+                            record["xy_shape"],
+                            net_offset,
+                            utm_zone,
+                            at_end=record["at_end"],
+                            slot_index=slot_index,
+                            slot_count=slot_count,
+                        ),
+                    },
+                }
+            )
 
     return {
         "lanes": {"type": "FeatureCollection", "features": lane_features},
@@ -213,12 +308,41 @@ def load_sumo_network() -> dict[str, Any]:
             "type": "FeatureCollection",
             "features": traffic_light_features,
         },
+        "signalLinks": {
+            "type": "FeatureCollection",
+            "features": signal_link_features,
+        },
         "counts": {
             "lanes": len(lane_features),
             "internalLanes": len(internal_lane_features),
             "trafficLights": len(traffic_light_features),
+            "signalLinks": len(signal_link_features),
         },
     }
+
+
+def map_traffic_light_ids_by_junction(root: ET.Element) -> dict[str, str]:
+    traffic_junction_ids = [
+        junction.attrib["id"]
+        for junction in root.findall("junction")
+        if junction.attrib.get("type") == "traffic_light" and junction.attrib.get("id")
+    ]
+    traffic_junction_ids.sort(key=len, reverse=True)
+
+    traffic_light_ids_by_junction: dict[str, str] = {}
+    for connection in root.findall("connection"):
+        traffic_light_id = connection.attrib.get("tl")
+        via_lane_id = connection.attrib.get("via", "")
+        if not traffic_light_id or not via_lane_id.startswith(":"):
+            continue
+
+        internal_lane_id = via_lane_id[1:]
+        for junction_id in traffic_junction_ids:
+            if internal_lane_id.startswith(f"{junction_id}_"):
+                traffic_light_ids_by_junction.setdefault(junction_id, traffic_light_id)
+                break
+
+    return traffic_light_ids_by_junction
 
 
 def parse_pair(value: str) -> tuple[float, float]:
@@ -231,12 +355,71 @@ def parse_sumo_shape(
     net_offset: tuple[float, float],
     utm_zone: int,
 ) -> list[list[float]]:
+    return sumo_xy_shape_to_lonlat(parse_sumo_xy_shape(shape), net_offset, utm_zone)
+
+
+def parse_sumo_xy_shape(shape: str) -> list[tuple[float, float]]:
     coordinates = []
     for point in shape.split():
-        x, y = parse_pair(point)
+        coordinates.append(parse_pair(point))
+    return coordinates
+
+
+def sumo_xy_shape_to_lonlat(
+    xy_shape: list[tuple[float, float]],
+    net_offset: tuple[float, float],
+    utm_zone: int,
+) -> list[list[float]]:
+    coordinates = []
+    for x, y in xy_shape:
         lon, lat = sumo_xy_to_lonlat(x, y, net_offset, utm_zone)
         coordinates.append([lon, lat])
     return coordinates
+
+
+def signal_stop_line_coordinates(
+    xy_shape: list[tuple[float, float]],
+    net_offset: tuple[float, float],
+    utm_zone: int,
+    at_end: bool = False,
+    slot_index: int = 0,
+    slot_count: int = 1,
+) -> list[list[float]]:
+    if len(xy_shape) < 2:
+        return sumo_xy_shape_to_lonlat(xy_shape, net_offset, utm_zone)
+
+    if at_end:
+        anchor_x, anchor_y = xy_shape[-1]
+        previous_x, previous_y = xy_shape[-2]
+        dx = anchor_x - previous_x
+        dy = anchor_y - previous_y
+    else:
+        anchor_x, anchor_y = xy_shape[0]
+        next_x, next_y = xy_shape[1]
+        dx = next_x - anchor_x
+        dy = next_y - anchor_y
+
+    length = math.hypot(dx, dy)
+    if length == 0:
+        return sumo_xy_shape_to_lonlat(xy_shape[:2], net_offset, utm_zone)
+
+    half_width_m = 3.0
+    perp_x = -dy / length
+    perp_y = dx / length
+    safe_slot_count = max(1, slot_count)
+    gap_m = 0.75 if safe_slot_count > 1 else 0
+    total_width_m = half_width_m * 2
+    segment_width_m = max(
+        0.35,
+        (total_width_m - gap_m * (safe_slot_count - 1)) / safe_slot_count,
+    )
+    slot_start_m = -half_width_m + slot_index * (segment_width_m + gap_m)
+    slot_end_m = slot_start_m + segment_width_m
+    endpoints = [
+        (anchor_x + perp_x * slot_start_m, anchor_y + perp_y * slot_start_m),
+        (anchor_x + perp_x * slot_end_m, anchor_y + perp_y * slot_end_m),
+    ]
+    return sumo_xy_shape_to_lonlat(endpoints, net_offset, utm_zone)
 
 
 def sumo_xy_to_lonlat(
@@ -511,7 +694,9 @@ async def sumo_reinickendorf(websocket: WebSocket) -> None:
     ]
 
     connection_label = f"reinickendorf-{id(websocket)}"
-    frame_delay_sec = parse_frame_delay(websocket)
+    speed_factor = parse_playback_speed(websocket)
+    seek_sec = parse_seek_sec(websocket)
+    producer_task: asyncio.Task[None] | None = None
 
     try:
         (SUMO_SCENARIO_DIR / "output").mkdir(exist_ok=True)
@@ -524,7 +709,9 @@ async def sumo_reinickendorf(websocket: WebSocket) -> None:
                 "type": "hello",
                 "backend": "sumo-traci",
                 "window": {"startSec": SUMO_START_SEC, "endSec": SUMO_END_SEC},
-                "frameDelaySec": frame_delay_sec,
+                "speedFactor": speed_factor,
+                "maxWebsocketFps": MAX_WEBSOCKET_FPS,
+                "seekSec": seek_sec,
             }
         )
 
@@ -535,51 +722,166 @@ async def sumo_reinickendorf(websocket: WebSocket) -> None:
         )
         connection = traci.getConnection(connection_label)
 
-        sim_sec = SUMO_START_SEC
-        while sim_sec <= SUMO_END_SEC:
-            await asyncio.to_thread(connection.simulationStep)
-            sim_sec = int(connection.simulation.getTime())
-            vehicle_ids = list(connection.vehicle.getIDList())
-            vehicles = []
+        latest_frame: dict[str, Any] | None = None
+        latest_sent_sec: int | None = None
+        producer_done = False
+        producer_error: Exception | None = None
+        frame_event = asyncio.Event()
 
-            for vehicle_id in vehicle_ids:
-                x, y = connection.vehicle.getPosition(vehicle_id)
-                lon, lat = connection.simulation.convertGeo(x, y)
-                vehicles.append(
-                    {
-                        "id": vehicle_id,
-                        "lon": lon,
-                        "lat": lat,
-                        "angle": round(float(connection.vehicle.getAngle(vehicle_id)), 3),
-                        "speed": round(float(connection.vehicle.getSpeed(vehicle_id)), 3),
-                        "lane": connection.vehicle.getLaneID(vehicle_id),
-                        "route": connection.vehicle.getRouteID(vehicle_id),
-                    }
+        async def produce_frames() -> None:
+            nonlocal latest_frame, producer_done, producer_error
+            try:
+                sim_sec = int(connection.simulation.getTime())
+                while sim_sec < seek_sec:
+                    await asyncio.to_thread(connection.simulationStep)
+                    sim_sec = int(connection.simulation.getTime())
+
+                loop = asyncio.get_running_loop()
+                playback_started_at = loop.time()
+                latest_frame = await asyncio.to_thread(
+                    build_sumo_frame,
+                    connection,
+                    sim_sec,
+                    0,
+                    speed_factor,
+                    speed_factor,
                 )
+                frame_event.set()
 
-            await websocket.send_json(
-                {
-                    "type": "frame",
-                    "simSec": sim_sec,
-                    "vehicles": vehicles,
-                    "vehicleCount": len(vehicles),
-                    "departed": list(connection.simulation.getDepartedIDList()),
-                    "arrived": list(connection.simulation.getArrivedIDList()),
-                }
-            )
-            await asyncio.sleep(frame_delay_sec)
+                while sim_sec < SUMO_END_SEC:
+                    wall_elapsed_sec = max(0.0, loop.time() - playback_started_at)
+                    target_sim_sec = min(
+                        SUMO_END_SEC,
+                        seek_sec + int(wall_elapsed_sec * speed_factor),
+                    )
+                    if target_sim_sec <= sim_sec:
+                        await asyncio.sleep(1 / MAX_WEBSOCKET_FPS)
+                        continue
 
+                    while sim_sec < target_sim_sec:
+                        await asyncio.to_thread(connection.simulationStep)
+                        sim_sec = int(connection.simulation.getTime())
+
+                    wall_elapsed_sec = max(0.0, loop.time() - playback_started_at)
+                    sim_elapsed_sec = max(0, sim_sec - seek_sec)
+                    effective_speed = (
+                        sim_elapsed_sec / wall_elapsed_sec if wall_elapsed_sec > 0 else speed_factor
+                    )
+                    latest_frame = await asyncio.to_thread(
+                        build_sumo_frame,
+                        connection,
+                        sim_sec,
+                        wall_elapsed_sec,
+                        speed_factor,
+                        effective_speed,
+                    )
+                    frame_event.set()
+            except Exception as error:  # pragma: no cover - runtime dependent
+                producer_error = error
+            finally:
+                producer_done = True
+                frame_event.set()
+
+        producer_task = asyncio.create_task(produce_frames())
+        send_interval_sec = 1 / MAX_WEBSOCKET_FPS
+
+        while True:
+            try:
+                await asyncio.wait_for(frame_event.wait(), timeout=send_interval_sec)
+            except asyncio.TimeoutError:
+                pass
+
+            frame = latest_frame
+            if frame is not None and frame.get("simSec") != latest_sent_sec:
+                await websocket.send_json(frame)
+                latest_sent_sec = int(frame["simSec"])
+
+            frame_event.clear()
+
+            if producer_done:
+                break
+
+        if producer_error:
+            raise producer_error
         await websocket.send_json({"type": "done"})
     except WebSocketDisconnect:
         return
     except Exception as error:
         await websocket.send_json({"type": "error", "message": str(error)})
     finally:
+        if producer_task and not producer_task.done():
+            producer_task.cancel()
+            try:
+                await producer_task
+            except asyncio.CancelledError:
+                pass
         try:
             traci.switch(connection_label)
             traci.close(False)
         except Exception:
             pass
+
+
+def build_sumo_frame(
+    connection: Any,
+    sim_sec: int,
+    wall_elapsed_sec: float,
+    requested_speed: float,
+    effective_speed: float,
+) -> dict[str, Any]:
+    vehicle_ids = list(connection.vehicle.getIDList())
+    vehicles = []
+    traffic_lights = live_traffic_light_states(connection)
+
+    for vehicle_id in vehicle_ids:
+        x, y = connection.vehicle.getPosition(vehicle_id)
+        lon, lat = connection.simulation.convertGeo(x, y)
+        vehicles.append(
+            {
+                "id": vehicle_id,
+                "lon": lon,
+                "lat": lat,
+                "angle": round(float(connection.vehicle.getAngle(vehicle_id)), 3),
+                "speed": round(float(connection.vehicle.getSpeed(vehicle_id)), 3),
+                "lane": connection.vehicle.getLaneID(vehicle_id),
+                "route": connection.vehicle.getRouteID(vehicle_id),
+            }
+        )
+
+    return {
+        "type": "frame",
+        "simSec": sim_sec,
+        "vehicles": vehicles,
+        "vehicleCount": len(vehicles),
+        "departed": list(connection.simulation.getDepartedIDList()),
+        "arrived": list(connection.simulation.getArrivedIDList()),
+        "trafficLights": traffic_lights,
+        "wallElapsedSec": round(wall_elapsed_sec, 3),
+        "requestedSpeed": round(requested_speed, 3),
+        "effectiveSpeed": round(effective_speed, 3),
+    }
+
+
+def live_traffic_light_states(connection: Any) -> dict[str, dict[str, Any]]:
+    states = {}
+    for traffic_light_id in connection.trafficlight.getIDList():
+        raw_state = connection.trafficlight.getRedYellowGreenState(traffic_light_id)
+        states[traffic_light_id] = {
+            "state": raw_state,
+            "display": display_traffic_light_state(raw_state),
+            "phase": int(connection.trafficlight.getPhase(traffic_light_id)),
+        }
+    return states
+
+
+def display_traffic_light_state(raw_state: str) -> str:
+    if any(char in raw_state for char in "gG"):
+        return "green"
+    if any(char in raw_state for char in "yY"):
+        return "yellow"
+    if any(char in raw_state for char in "rRuUsS"):
+        return "red"
+    return "off"
 
 
 def parse_frame_delay(websocket: WebSocket) -> float:
@@ -597,3 +899,37 @@ def parse_frame_delay(websocket: WebSocket) -> float:
         delay = DEFAULT_FRAME_DELAY_SEC
 
     return max(0.0, min(delay, 2.0))
+
+
+def parse_playback_speed(websocket: WebSocket) -> float:
+    configured_speed = os.getenv("SUMO_PLAYBACK_SPEED")
+    raw_speed = websocket.query_params.get("speed")
+    raw_delay_ms = websocket.query_params.get("delayMs")
+
+    try:
+        if raw_speed is not None:
+            speed = float(raw_speed)
+        elif configured_speed is not None:
+            speed = float(configured_speed)
+        elif raw_delay_ms is not None:
+            delay_ms = max(0.001, float(raw_delay_ms))
+            speed = 1000 / delay_ms
+        else:
+            speed = DEFAULT_SUMO_SPEED
+    except ValueError:
+        speed = DEFAULT_SUMO_SPEED
+
+    return max(1.0, min(speed, 3600.0))
+
+
+def parse_seek_sec(websocket: WebSocket) -> int:
+    raw_seek_sec = websocket.query_params.get("seekSec")
+    if raw_seek_sec is None:
+        return SUMO_START_SEC
+
+    try:
+        seek_sec = int(float(raw_seek_sec))
+    except ValueError:
+        return SUMO_START_SEC
+
+    return max(SUMO_START_SEC, min(seek_sec, SUMO_END_SEC))

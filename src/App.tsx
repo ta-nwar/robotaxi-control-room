@@ -4,17 +4,21 @@ import {
   FastForward,
   Gauge,
   MapPinned,
+  Moon,
   Pause,
   Play,
   RotateCcw,
+  Sun,
   Timer,
 } from "lucide-react"
-import type { Feature, FeatureCollection, LineString, Polygon } from "geojson"
+import type { Feature, FeatureCollection, Geometry, LineString, Polygon } from "geojson"
 import maplibregl, { type GeoJSONSource, type LngLatBoundsLike } from "maplibre-gl"
-import { useEffect, useMemo, useRef, useState } from "react"
+import { useCallback, useEffect, useMemo, useRef, useState } from "react"
 import "./App.css"
 
 const mapStyleUrl = import.meta.env.VITE_MAPTILER_STYLE_URL as string | undefined
+const configuredDarkMapStyleUrl = import.meta.env.VITE_MAPTILER_DARK_STYLE_URL as string | undefined
+const darkMapStyleUrl = configuredDarkMapStyleUrl ?? maptilerDarkStyleUrl(mapStyleUrl)
 const scenarioApiUrl = import.meta.env.VITE_SCENARIO_API_URL as string | undefined
 const alignedFlatBearing = -1.3
 const cinematicTiltBearing = -13
@@ -42,12 +46,30 @@ type SumoVehicle = {
   route: string
 }
 
+type SumoTrafficLightDisplay =
+  | "green"
+  | "yellow"
+  | "red"
+  | "orange"
+  | "off"
+  | "static"
+
+type SumoTrafficLightState = {
+  state: string
+  display: SumoTrafficLightDisplay
+  phase: number
+}
+
 type SumoFrame = {
   simSec: number
   vehicleCount: number
   vehicles: SumoVehicle[]
   departed: string[]
   arrived: string[]
+  trafficLights: Record<string, SumoTrafficLightState>
+  wallElapsedSec?: number
+  requestedSpeed?: number
+  effectiveSpeed?: number
 }
 
 type SumoNetwork = {
@@ -55,10 +77,12 @@ type SumoNetwork = {
   lanes: FeatureCollection<LineString>
   internalLanes: FeatureCollection<LineString>
   trafficLights: FeatureCollection
+  signalLinks: FeatureCollection<LineString>
   counts: {
     lanes: number
     internalLanes: number
     trafficLights: number
+    signalLinks: number
   }
 }
 
@@ -103,9 +127,16 @@ type PreparedTrip = Trip & {
 type MapSection = "replay" | "base"
 type ScenarioDataSource = "local-bundle" | "local-backend" | "remote-backend"
 type SumoLayerKey = "lanes" | "vehicles" | "trafficLights" | "boundary"
+type AppTheme = "dark" | "light"
+type MapCamera = {
+  center: Coordinate
+  zoom: number
+  bearing: number
+  pitch: number
+}
 
 const speedOptions = [1, 10, 30, 60, 120, 240]
-const sumoDelayOptions = [0, 16, 35, 100, 250, 1000]
+const sumoSpeedOptions = [1, 2, 3, 10, 60, 600]
 const replayLayerIds = [
   "roads-glow",
   "roads",
@@ -137,8 +168,41 @@ function formatClock(sec: number) {
     .padStart(2, "0")}:${second.toString().padStart(2, "0")}`
 }
 
+function maptilerDarkStyleUrl(styleUrl: string | undefined) {
+  if (!styleUrl) {
+    return undefined
+  }
+
+  try {
+    const url = new URL(styleUrl)
+    const key = url.searchParams.get("key")
+    if (!key) {
+      return styleUrl
+    }
+
+    return `https://api.maptiler.com/maps/dataviz-dark/style.json?key=${key}`
+  } catch {
+    return styleUrl
+  }
+}
+
 function formatInteger(value: number) {
   return new Intl.NumberFormat("en-US").format(value)
+}
+
+function formatDuration(seconds: number) {
+  const safeSeconds = Math.max(0, Math.floor(seconds))
+  const minutes = Math.floor(safeSeconds / 60)
+  const remainingSeconds = safeSeconds % 60
+  return `${minutes}:${remainingSeconds.toString().padStart(2, "0")}`
+}
+
+function formatSpeedFactor(value: number | undefined) {
+  if (value === undefined || !Number.isFinite(value)) {
+    return "--"
+  }
+
+  return `${value.toFixed(value >= 100 ? 0 : 1)}x`
 }
 
 function haversineMeters(a: Coordinate, b: Coordinate) {
@@ -227,35 +291,302 @@ function pointFeatureCollection(vehicles: SumoVehicle[]): FeatureCollection {
   }
 }
 
+function trafficLightFeatureCollection(
+  network: SumoNetwork | null,
+  frame: SumoFrame | null,
+): FeatureCollection<LineString> {
+  if (!network) {
+    return emptyFeatureCollection()
+  }
+
+  const liveStates = frame?.trafficLights ?? {}
+
+  return {
+    type: "FeatureCollection",
+    features: network.signalLinks.features.map((feature) => {
+      const properties = feature.properties ?? {}
+      const trafficLightId = String(properties.trafficLightId ?? "")
+      const linkIndex =
+        typeof properties.linkIndex === "number"
+          ? properties.linkIndex
+          : Number(properties.linkIndex)
+      const liveState = trafficLightId ? liveStates[trafficLightId] : undefined
+      const stateChar = liveState?.state?.[linkIndex] ?? ""
+
+      return {
+        ...feature,
+        properties: {
+          ...properties,
+          display: displaySignalState(stateChar),
+          state: stateChar,
+          phase: liveState?.phase ?? null,
+        },
+      }
+    }),
+  }
+}
+
+function trafficLightStateSignature(trafficLights: Record<string, SumoTrafficLightState>) {
+  return Object.keys(trafficLights)
+    .sort()
+    .map((id) => {
+      const light = trafficLights[id]
+      return `${id}:${light.phase}:${light.state}`
+    })
+    .join("|")
+}
+
+function displaySignalState(stateChar: string): SumoTrafficLightDisplay {
+  if (stateChar === "G" || stateChar === "g") {
+    return "green"
+  }
+
+  if (stateChar === "y" || stateChar === "Y") {
+    return "yellow"
+  }
+
+  if (stateChar === "u") {
+    return "orange"
+  }
+
+  if (stateChar === "r" || stateChar === "R" || stateChar === "s") {
+    return "red"
+  }
+
+  if (stateChar === "o" || stateChar === "O") {
+    return "off"
+  }
+
+  return "static"
+}
+
 function source(map: maplibregl.Map, id: string) {
   return map.getSource(id) as GeoJSONSource | undefined
 }
 
-function emptyFeatureCollection(): FeatureCollection {
+function emptyFeatureCollection<T extends Geometry = Geometry>(): FeatureCollection<T> {
   return { type: "FeatureCollection", features: [] }
+}
+
+function ensureSumoLaneLayers(map: maplibregl.Map) {
+  if (!map.isStyleLoaded()) {
+    return false
+  }
+
+  if (!map.getSource("sumo-internal-lanes")) {
+    map.addSource("sumo-internal-lanes", {
+      type: "geojson",
+      data: emptyFeatureCollection<LineString>(),
+    })
+  }
+
+  if (!map.getSource("sumo-lanes")) {
+    map.addSource("sumo-lanes", {
+      type: "geojson",
+      data: emptyFeatureCollection<LineString>(),
+    })
+  }
+
+  const beforeVehicleLayer = map.getLayer("sumo-vehicles") ? "sumo-vehicles" : undefined
+
+  if (!map.getLayer("sumo-internal-lanes")) {
+    map.addLayer(
+      {
+        id: "sumo-internal-lanes",
+        type: "line",
+        source: "sumo-internal-lanes",
+        paint: {
+          "line-color": "#8bfff0",
+          "line-width": [
+            "interpolate",
+            ["linear"],
+            ["zoom"],
+            11,
+            0.24,
+            14,
+            0.58,
+            16,
+            1.1,
+          ],
+          "line-opacity": 0.2,
+        },
+      },
+      beforeVehicleLayer,
+    )
+  }
+
+  if (!map.getLayer("sumo-lanes")) {
+    map.addLayer(
+      {
+        id: "sumo-lanes",
+        type: "line",
+        source: "sumo-lanes",
+        paint: {
+          "line-color": "#d8f7ff",
+          "line-width": [
+            "interpolate",
+            ["linear"],
+            ["zoom"],
+            11,
+            0.32,
+            14,
+            0.8,
+            16,
+            1.45,
+          ],
+          "line-opacity": 0.46,
+        },
+      },
+      beforeVehicleLayer,
+    )
+  }
+
+  return true
+}
+
+function applySumoOverlayTheme(map: maplibregl.Map, theme: AppTheme) {
+  if (map.getLayer("sumo-internal-lanes")) {
+    map.setPaintProperty(
+      "sumo-internal-lanes",
+      "line-color",
+      theme === "light" ? "#138b86" : "#8bfff0",
+    )
+    map.setPaintProperty("sumo-internal-lanes", "line-opacity", theme === "light" ? 0.34 : 0.2)
+  }
+
+  if (map.getLayer("sumo-lanes")) {
+    map.setPaintProperty(
+      "sumo-lanes",
+      "line-color",
+      theme === "light" ? "#355c67" : "#d8f7ff",
+    )
+    map.setPaintProperty("sumo-lanes", "line-opacity", theme === "light" ? 0.68 : 0.46)
+  }
+}
+
+function ensureSumoTrafficLightLayers(map: maplibregl.Map) {
+  const hasSignalSource = Boolean(map.getSource("sumo-traffic-lights"))
+  const hasSignalLayer = Boolean(map.getLayer("sumo-traffic-lights"))
+  if (!map.isStyleLoaded() && (!hasSignalSource || !hasSignalLayer)) {
+    return false
+  }
+
+  if (!hasSignalSource) {
+    map.addSource("sumo-traffic-lights", {
+      type: "geojson",
+      data: emptyFeatureCollection<LineString>(),
+    })
+  }
+
+  if (!hasSignalLayer) {
+    map.addLayer(
+      {
+        id: "sumo-traffic-lights",
+        type: "line",
+        source: "sumo-traffic-lights",
+        paint: {
+          "line-color": [
+            "match",
+            ["get", "display"],
+            "green",
+            "#35e878",
+            "yellow",
+            "#d8c344",
+            "red",
+            "#e34343",
+            "orange",
+            "#c98532",
+            "off",
+            "#8b969b",
+            "static",
+            "#8b969b",
+            "#8b969b",
+          ],
+          "line-width": [
+            "interpolate",
+            ["linear"],
+            ["zoom"],
+            13,
+            0.35,
+            15.2,
+            0.95,
+            16.2,
+            1.55,
+            18,
+            2.25,
+          ],
+          "line-opacity": [
+            "interpolate",
+            ["linear"],
+            ["zoom"],
+            13,
+            0.3,
+            15.2,
+            0.72,
+            16.2,
+            0.92,
+            18,
+            1,
+          ],
+        },
+      },
+      map.getLayer("sumo-vehicles") ? "sumo-vehicles" : undefined,
+    )
+  }
+
+  return true
 }
 
 function createVehicleMarkerImage() {
   const pixelRatio = 4
   const canvas = document.createElement("canvas")
-  canvas.width = 6 * pixelRatio
-  canvas.height = 16 * pixelRatio
+  canvas.width = 14 * pixelRatio
+  canvas.height = 24 * pixelRatio
   const context = canvas.getContext("2d")
   if (!context) {
     return null
   }
 
   context.scale(pixelRatio, pixelRatio)
-  context.fillStyle = "rgba(21, 17, 9, 0.34)"
-  context.fillRect(1, 2.5, 4, 11)
-  context.fillStyle = "#c9962e"
-  context.fillRect(1.4, 1.5, 3.2, 13)
-  context.fillStyle = "#f0c660"
-  context.fillRect(1.9, 2, 2.2, 2.6)
-  context.fillStyle = "#1b2021"
-  context.fillRect(2, 5.6, 2, 4.5)
-  context.fillStyle = "#8a641d"
-  context.fillRect(2, 11.2, 2, 2.4)
+  context.translate(7, 12)
+
+  context.shadowColor = "rgba(255, 182, 36, 0.7)"
+  context.shadowBlur = 4
+  context.fillStyle = "rgba(255, 191, 52, 0.38)"
+  context.beginPath()
+  context.roundRect(-4.2, -8.6, 8.4, 17.2, 3.7)
+  context.fill()
+  context.shadowBlur = 0
+
+  context.fillStyle = "rgba(68, 43, 4, 0.38)"
+  context.beginPath()
+  context.roundRect(-3.2, -7.2, 6.4, 14.6, 2.8)
+  context.fill()
+
+  context.fillStyle = "#e5a51d"
+  context.beginPath()
+  context.moveTo(0, -9)
+  context.bezierCurveTo(2.8, -7.3, 3.8, -4.4, 3.6, 4.5)
+  context.bezierCurveTo(3.2, 7.3, 2.1, 8.5, 0, 8.9)
+  context.bezierCurveTo(-2.1, 8.5, -3.2, 7.3, -3.6, 4.5)
+  context.bezierCurveTo(-3.8, -4.4, -2.8, -7.3, 0, -9)
+  context.closePath()
+  context.fill()
+
+  context.fillStyle = "#ffd76a"
+  context.beginPath()
+  context.roundRect(-1.8, -7.1, 3.6, 2.5, 1.1)
+  context.fill()
+
+  context.fillStyle = "#10161a"
+  context.beginPath()
+  context.roundRect(-2.1, -3.7, 4.2, 6.9, 1.9)
+  context.fill()
+
+  context.fillStyle = "#b87b10"
+  context.beginPath()
+  context.roundRect(-1.8, 5.1, 3.6, 2.2, 1)
+  context.fill()
 
   return {
     data: context.getImageData(0, 0, canvas.width, canvas.height),
@@ -378,13 +709,18 @@ export default function App() {
   const [sumoNetwork, setSumoNetwork] = useState<SumoNetwork | null>(null)
   const [isSumoRunning, setIsSumoRunning] = useState(false)
   const [sumoSessionKey, setSumoSessionKey] = useState(0)
-  const [sumoFrameDelayMs, setSumoFrameDelayMs] = useState(35)
+  const [sumoPlaybackSpeed, setSumoPlaybackSpeed] = useState(60)
+  const [sumoSeekSec, setSumoSeekSec] = useState(21_600)
+  const [sumoSeekDraftSec, setSumoSeekDraftSec] = useState(21_600)
+  const [isSumoScrubbing, setIsSumoScrubbing] = useState(false)
   const [isPlaying, setIsPlaying] = useState(false)
   const [isTiltEnabled, setIsTiltEnabled] = useState(false)
   const [activeSection, setActiveSection] = useState<MapSection>("base")
+  const [appTheme, setAppTheme] = useState<AppTheme>("dark")
   const [sumoLayerVisibility, setSumoLayerVisibilityState] = useState<
     Record<SumoLayerKey, boolean>
   >(defaultSumoLayerVisibility)
+  const [baseMapReadyTick, setBaseMapReadyTick] = useState(0)
   const [speed, setSpeed] = useState(60)
   const [timeSec, setTimeSec] = useState(21_600)
   const [selectedTripId, setSelectedTripId] = useState<string | null>(null)
@@ -394,8 +730,100 @@ export default function App() {
   const baseMapContainerRef = useRef<HTMLDivElement | null>(null)
   const baseMapRef = useRef<maplibregl.Map | null>(null)
   const activeSectionRef = useRef<MapSection>("base")
+  const appThemeRef = useRef<AppTheme>("dark")
+  const pendingThemeCameraRef = useRef<MapCamera | null>(null)
+  const sumoNetworkRef = useRef<SumoNetwork | null>(null)
+  const sumoLayerVisibilityRef = useRef<Record<SumoLayerKey, boolean>>(
+    defaultSumoLayerVisibility,
+  )
+  const sumoTrafficLightGeojsonRef = useRef<FeatureCollection<LineString>>(
+    emptyFeatureCollection<LineString>(),
+  )
+  const latestSumoFrameRef = useRef<SumoFrame | null>(null)
+  const lastTrafficLightSignatureRef = useRef("")
+  const lastSumoUiUpdateRef = useRef(0)
+  const isSumoScrubbingRef = useRef(false)
   const animationRef = useRef<number | null>(null)
   const lastFrameRef = useRef<number | null>(null)
+
+  useEffect(() => {
+    sumoNetworkRef.current = sumoNetwork
+  }, [sumoNetwork])
+
+  useEffect(() => {
+    sumoLayerVisibilityRef.current = sumoLayerVisibility
+  }, [sumoLayerVisibility])
+
+  useEffect(() => {
+    isSumoScrubbingRef.current = isSumoScrubbing
+  }, [isSumoScrubbing])
+
+  useEffect(() => {
+    appThemeRef.current = appTheme
+  }, [appTheme])
+
+  const currentMapStyleUrl = appTheme === "dark" ? darkMapStyleUrl : mapStyleUrl
+
+  const captureActiveMapCamera = () => {
+    const map = activeSection === "base" ? baseMapRef.current : mapRef.current
+    if (!map) {
+      return
+    }
+
+    const center = map.getCenter()
+    pendingThemeCameraRef.current = {
+      center: [center.lng, center.lat],
+      zoom: map.getZoom(),
+      bearing: map.getBearing(),
+      pitch: map.getPitch(),
+    }
+  }
+
+  const syncSumoNetworkLayers = useCallback((map = baseMapRef.current) => {
+    const network = sumoNetworkRef.current
+    if (!map || !network || !ensureSumoLaneLayers(map)) {
+      return false
+    }
+
+    ensureSumoTrafficLightLayers(map)
+    applySumoOverlayTheme(map, appThemeRef.current)
+    source(map, "sumo-lanes")?.setData(network.lanes)
+    source(map, "sumo-internal-lanes")?.setData(network.internalLanes)
+    source(map, "sumo-traffic-lights")?.setData(sumoTrafficLightGeojsonRef.current)
+    setSumoLayerVisibility(map, sumoLayerVisibilityRef.current)
+    map.triggerRepaint()
+    return true
+  }, [])
+
+  const updateSumoTrafficLightSource = useCallback(
+    (map: maplibregl.Map, frame: SumoFrame, force = false) => {
+      const network = sumoNetworkRef.current
+      if (!network || network.signalLinks.features.length === 0) {
+        return false
+      }
+
+      const lightSignature = trafficLightStateSignature(frame.trafficLights)
+      if (!force && lightSignature === lastTrafficLightSignatureRef.current) {
+        return true
+      }
+
+      if (!ensureSumoTrafficLightLayers(map)) {
+        return false
+      }
+
+      const nextTrafficLights = trafficLightFeatureCollection(network, frame)
+      if (nextTrafficLights.features.length === 0) {
+        return false
+      }
+
+      lastTrafficLightSignatureRef.current = lightSignature
+      sumoTrafficLightGeojsonRef.current = nextTrafficLights
+      source(map, "sumo-traffic-lights")?.setData(nextTrafficLights)
+      map.triggerRepaint()
+      return true
+    },
+    [],
+  )
 
   useEffect(() => {
     async function loadScenario() {
@@ -457,6 +885,21 @@ export default function App() {
     () => pointFeatureCollection(sumoFrame?.vehicles ?? []),
     [sumoFrame],
   )
+
+  const sumoTrafficLightGeojson = useMemo(
+    () => trafficLightFeatureCollection(sumoNetwork, null),
+    [sumoNetwork],
+  )
+
+  useEffect(() => {
+    sumoTrafficLightGeojsonRef.current = sumoTrafficLightGeojson
+    lastTrafficLightSignatureRef.current = ""
+    const map = baseMapRef.current
+    const latestFrame = latestSumoFrameRef.current
+    if (map && latestFrame) {
+      updateSumoTrafficLightSource(map, latestFrame, true)
+    }
+  }, [sumoTrafficLightGeojson, updateSumoTrafficLightSource])
 
   useEffect(() => {
     if (activeSection !== "base" || sumoNetwork || !scenarioApiUrl) {
@@ -563,18 +1006,19 @@ export default function App() {
       activeSection !== "replay" ||
       !mapContainerRef.current ||
       mapRef.current ||
-      !mapStyleUrl
+      !currentMapStyleUrl
     ) {
       return
     }
 
+    const restoredCamera = pendingThemeCameraRef.current
     const map = new maplibregl.Map({
       container: mapContainerRef.current,
-      style: mapStyleUrl,
-      center: [13.3603, 52.5634],
-      zoom: 12.4,
-      pitch: 0,
-      bearing: alignedFlatBearing,
+      style: currentMapStyleUrl,
+      center: restoredCamera?.center ?? [13.3603, 52.5634],
+      zoom: restoredCamera?.zoom ?? 12.4,
+      pitch: restoredCamera?.pitch ?? 0,
+      bearing: restoredCamera?.bearing ?? alignedFlatBearing,
       attributionControl: false,
     })
 
@@ -614,8 +1058,8 @@ export default function App() {
         type: "fill",
         source: "outside-mask",
         paint: {
-          "fill-color": "#b9c2c7",
-          "fill-opacity": 0.34,
+          "fill-color": "#071015",
+          "fill-opacity": 0.38,
         },
       })
       map.addLayer({
@@ -702,16 +1146,21 @@ export default function App() {
       })
       setOverlayVisibility(map, activeSectionRef.current)
 
-      const bounds = scenario.serviceArea.geometry.coordinates[0].reduce(
-        (nextBounds, point) => nextBounds.extend(point as Coordinate),
-        new maplibregl.LngLatBounds(scenario.depot.coordinates, scenario.depot.coordinates),
-      )
-      map.fitBounds(bounds as LngLatBoundsLike, {
-        padding: 92,
-        duration: 0,
-      })
-      map.jumpTo({ bearing: alignedFlatBearing, pitch: 0 })
-      requestAnimationFrame(() => applyMapCamera(map, false, 0))
+      if (restoredCamera) {
+        map.jumpTo(restoredCamera)
+        pendingThemeCameraRef.current = null
+      } else {
+        const bounds = scenario.serviceArea.geometry.coordinates[0].reduce(
+          (nextBounds, point) => nextBounds.extend(point as Coordinate),
+          new maplibregl.LngLatBounds(scenario.depot.coordinates, scenario.depot.coordinates),
+        )
+        map.fitBounds(bounds as LngLatBoundsLike, {
+          padding: 92,
+          duration: 0,
+        })
+        map.jumpTo({ bearing: alignedFlatBearing, pitch: 0 })
+        requestAnimationFrame(() => applyMapCamera(map, false, 0))
+      }
     })
 
     map.on("click", "vehicles", (event) => {
@@ -729,7 +1178,7 @@ export default function App() {
       map.remove()
       mapRef.current = null
     }
-  }, [activeSection, scenario])
+  }, [activeSection, currentMapStyleUrl, scenario])
 
   useEffect(() => {
     if (
@@ -737,40 +1186,33 @@ export default function App() {
       activeSection !== "base" ||
       !baseMapContainerRef.current ||
       baseMapRef.current ||
-      !mapStyleUrl
+      !currentMapStyleUrl
     ) {
       return
     }
 
+    const restoredCamera = pendingThemeCameraRef.current
     const map = new maplibregl.Map({
       container: baseMapContainerRef.current,
-      style: mapStyleUrl,
-      center: [13.3603, 52.5634],
-      zoom: 12.2,
-      pitch: 0,
-      bearing: 0,
+      style: currentMapStyleUrl,
+      center: restoredCamera?.center ?? [13.3603, 52.5634],
+      zoom: restoredCamera?.zoom ?? 12.2,
+      pitch: restoredCamera?.pitch ?? 0,
+      bearing: restoredCamera?.bearing ?? 0,
       attributionControl: false,
     })
 
     map.addControl(new maplibregl.NavigationControl({ visualizePitch: true }), "bottom-right")
     map.addControl(new maplibregl.AttributionControl({ compact: true }))
 
+    const syncNetworkLayers = () => {
+      syncSumoNetworkLayers(map)
+    }
+
     map.on("load", () => {
       map.addSource("base-service-area", {
         type: "geojson",
         data: scenario.serviceArea,
-      })
-      map.addSource("sumo-lanes", {
-        type: "geojson",
-        data: emptyFeatureCollection(),
-      })
-      map.addSource("sumo-internal-lanes", {
-        type: "geojson",
-        data: emptyFeatureCollection(),
-      })
-      map.addSource("sumo-traffic-lights", {
-        type: "geojson",
-        data: emptyFeatureCollection(),
       })
       map.addSource("sumo-vehicles", {
         type: "geojson",
@@ -783,46 +1225,6 @@ export default function App() {
         })
       }
       map.addLayer({
-        id: "sumo-internal-lanes",
-        type: "line",
-        source: "sumo-internal-lanes",
-        paint: {
-          "line-color": "#11191d",
-          "line-width": [
-            "interpolate",
-            ["linear"],
-            ["zoom"],
-            11,
-            0.24,
-            14,
-            0.58,
-            16,
-            1.1,
-          ],
-          "line-opacity": 0.24,
-        },
-      })
-      map.addLayer({
-        id: "sumo-lanes",
-        type: "line",
-        source: "sumo-lanes",
-        paint: {
-          "line-color": "#11191d",
-          "line-width": [
-            "interpolate",
-            ["linear"],
-            ["zoom"],
-            11,
-            0.32,
-            14,
-            0.8,
-            16,
-            1.45,
-          ],
-          "line-opacity": 0.42,
-        },
-      })
-      map.addLayer({
         id: "base-service-area-line",
         type: "line",
         source: "base-service-area",
@@ -831,28 +1233,6 @@ export default function App() {
           "line-width": 2.4,
           "line-dasharray": [2.4, 1.2],
           "line-opacity": 0.96,
-        },
-      })
-      map.addLayer({
-        id: "sumo-traffic-lights",
-        type: "circle",
-        source: "sumo-traffic-lights",
-        paint: {
-          "circle-color": "#11191d",
-          "circle-radius": [
-            "interpolate",
-            ["linear"],
-            ["zoom"],
-            11,
-            1.8,
-            14,
-            3,
-            16,
-            4.2,
-          ],
-          "circle-opacity": 0.82,
-          "circle-stroke-color": "rgba(255, 255, 255, 0.9)",
-          "circle-stroke-width": 0.8,
         },
       })
       map.addLayer({
@@ -879,7 +1259,19 @@ export default function App() {
         },
       })
       setSumoLayerVisibility(map, defaultSumoLayerVisibility)
+      syncNetworkLayers()
+      if (restoredCamera) {
+        map.jumpTo(restoredCamera)
+        pendingThemeCameraRef.current = null
+      }
+      setBaseMapReadyTick((tick) => tick + 1)
+      map.once("idle", () => {
+        syncNetworkLayers()
+        setBaseMapReadyTick((tick) => tick + 1)
+      })
     })
+    map.on("idle", syncNetworkLayers)
+    map.on("styledata", syncNetworkLayers)
     baseMapRef.current = map
 
     const resizeObserver = new ResizeObserver(() => map.resize())
@@ -887,10 +1279,13 @@ export default function App() {
 
     return () => {
       resizeObserver.disconnect()
+      map.off("idle", syncNetworkLayers)
+      map.off("styledata", syncNetworkLayers)
       map.remove()
       baseMapRef.current = null
+      setBaseMapReadyTick((tick) => tick + 1)
     }
-  }, [activeSection, scenario])
+  }, [activeSection, currentMapStyleUrl, scenario, syncSumoNetworkLayers])
 
   useEffect(() => {
     const map = baseMapRef.current
@@ -899,18 +1294,22 @@ export default function App() {
     }
 
     source(map, "sumo-vehicles")?.setData(sumoVehicleGeojson)
-  }, [sumoVehicleGeojson])
+  }, [baseMapReadyTick, sumoVehicleGeojson])
+
+  useEffect(() => {
+    syncSumoNetworkLayers()
+  }, [baseMapReadyTick, sumoLayerVisibility, sumoNetwork, syncSumoNetworkLayers])
 
   useEffect(() => {
     const map = baseMapRef.current
-    if (!map || !map.isStyleLoaded() || !sumoNetwork) {
+    if (!map || !ensureSumoTrafficLightLayers(map)) {
       return
     }
 
-    source(map, "sumo-lanes")?.setData(sumoNetwork.lanes)
-    source(map, "sumo-internal-lanes")?.setData(sumoNetwork.internalLanes)
-    source(map, "sumo-traffic-lights")?.setData(sumoNetwork.trafficLights)
-  }, [sumoNetwork])
+    source(map, "sumo-traffic-lights")?.setData(sumoTrafficLightGeojson)
+    setSumoLayerVisibility(map, sumoLayerVisibility)
+    map.triggerRepaint()
+  }, [baseMapReadyTick, sumoLayerVisibility, sumoTrafficLightGeojson])
 
   useEffect(() => {
     const map = baseMapRef.current
@@ -938,9 +1337,16 @@ export default function App() {
       return
     }
 
-    const nextWsUrl = withQueryParam(wsUrl, "delayMs", sumoFrameDelayMs)
+    const nextWsUrl = withQueryParam(
+      withQueryParam(wsUrl, "speed", sumoPlaybackSpeed),
+      "seekSec",
+      sumoSeekSec,
+    )
     let isClosed = false
     let socket: WebSocket | null = null
+    lastTrafficLightSignatureRef.current = ""
+    latestSumoFrameRef.current = null
+    lastSumoUiUpdateRef.current = 0
     setSumoStatus("Checking backend")
 
     async function connectToSumo() {
@@ -990,14 +1396,34 @@ export default function App() {
         }
 
         if (message.type === "frame") {
-          setSumoFrame({
+          const nextFrame = {
             simSec: message.simSec,
             vehicleCount: message.vehicleCount,
             vehicles: message.vehicles,
             departed: message.departed,
             arrived: message.arrived,
-          })
-          setSumoStatus("Streaming")
+            trafficLights: message.trafficLights ?? {},
+            wallElapsedSec: message.wallElapsedSec,
+            requestedSpeed: message.requestedSpeed,
+            effectiveSpeed: message.effectiveSpeed,
+          }
+          latestSumoFrameRef.current = nextFrame
+          const map = baseMapRef.current
+          if (map?.isStyleLoaded()) {
+            source(map, "sumo-vehicles")?.setData(pointFeatureCollection(nextFrame.vehicles))
+          }
+          if (map) {
+            updateSumoTrafficLightSource(map, nextFrame)
+          }
+          const now = performance.now()
+          if (now - lastSumoUiUpdateRef.current > 250) {
+            lastSumoUiUpdateRef.current = now
+            if (!isSumoScrubbingRef.current) {
+              setSumoSeekDraftSec(message.simSec)
+            }
+            setSumoFrame(nextFrame)
+            setSumoStatus("Streaming")
+          }
           return
         }
 
@@ -1029,7 +1455,14 @@ export default function App() {
       isClosed = true
       socket?.close()
     }
-  }, [activeSection, isSumoRunning, sumoFrameDelayMs, sumoSessionKey])
+  }, [
+    activeSection,
+    isSumoRunning,
+    sumoPlaybackSpeed,
+    sumoSeekSec,
+    sumoSessionKey,
+    updateSumoTrafficLightSource,
+  ])
 
   useEffect(() => {
     const map = mapRef.current
@@ -1090,6 +1523,28 @@ export default function App() {
   const progressPercent = scenario
     ? ((timeSec - scenario.scenario.startSec) / scenario.scenario.durationSec) * 100
     : 0
+  const sumoWindowStartSec = scenario?.scenario.startSec ?? 21_600
+  const sumoWindowEndSec = scenario?.scenario.endSec ?? 25_200
+  const sumoProgressPercent = scenario
+    ? ((sumoSeekDraftSec - sumoWindowStartSec) / scenario.scenario.durationSec) * 100
+    : 0
+
+  const commitSumoSeek = (targetSec = sumoSeekDraftSec) => {
+    const nextSeekSec = Math.max(
+      sumoWindowStartSec,
+      Math.min(Math.round(targetSec), sumoWindowEndSec),
+    )
+    setIsSumoScrubbing(false)
+    setSumoSeekDraftSec(nextSeekSec)
+    setSumoSeekSec(nextSeekSec)
+    setSumoFrame(null)
+    if (isSumoRunning) {
+      setSumoStatus("Seeking")
+      setSumoSessionKey((current) => current + 1)
+    } else {
+      setSumoStatus("Ready")
+    }
+  }
 
   const reset = () => {
     if (!scenario) {
@@ -1101,7 +1556,7 @@ export default function App() {
   }
 
   return (
-    <main className="app-shell">
+    <main className={`app-shell theme-${appTheme}`}>
       <aside className="nav-rail" aria-label="Simulation navigation">
         <div className="brand-mark">
           <CarFront size={18} aria-hidden="true" />
@@ -1149,47 +1604,136 @@ export default function App() {
 
       {activeSection === "base" ? (
         <section className="sumo-panel" aria-label="SUMO live simulation">
-          <div>
-            <p className="label">SUMO Live</p>
-            <h1>Reinickendorf microscopic replay</h1>
-            <p>
-              Vehicle positions are streamed from the SUMO backend through TraCI.
-            </p>
+          <div className="panel-title-row">
+            <div>
+              <p className="label">SUMO Live</p>
+              <h1>Reinickendorf microscopic replay</h1>
+              <p>
+                Vehicle positions are streamed from the SUMO backend through TraCI.
+              </p>
+            </div>
+            <button
+              type="button"
+              className="theme-toggle"
+              title={appTheme === "dark" ? "Switch to light map" : "Switch to dark map"}
+              aria-label={appTheme === "dark" ? "Switch to light map" : "Switch to dark map"}
+              onClick={() => {
+                captureActiveMapCamera()
+                setAppTheme((theme) => (theme === "dark" ? "light" : "dark"))
+              }}
+            >
+              {appTheme === "dark" ? (
+                <Sun size={16} aria-hidden="true" />
+              ) : (
+                <Moon size={16} aria-hidden="true" />
+              )}
+            </button>
           </div>
           <div className="sumo-status-grid">
             <Metric label="Status" value={sumoStatus} />
             <Metric label="Time" value={sumoFrame ? formatClock(sumoFrame.simSec) : "--"} />
+            <Metric
+              label="Elapsed"
+              value={
+                sumoFrame?.wallElapsedSec !== undefined
+                  ? formatDuration(sumoFrame.wallElapsedSec)
+                  : "--"
+              }
+            />
+            <Metric label="Actual" value={formatSpeedFactor(sumoFrame?.effectiveSpeed)} />
             <Metric label="Vehicles" value={sumoFrame?.vehicleCount ?? 0} />
-            <Metric label="Lights" value={sumoNetwork?.counts.trafficLights ?? "--"} />
+            <Metric
+              label="Lights"
+              value={
+                sumoNetwork
+                  ? `${sumoTrafficLightGeojson.features.length}/${sumoNetwork.counts.signalLinks}`
+                  : "--"
+              }
+            />
           </div>
           <div className="sumo-run-controls" aria-label="SUMO run controls">
+            <div className="sumo-timeline-panel" aria-label="SUMO timeline">
+              <div className="timeline-meta">
+                <strong>{formatClock(sumoSeekDraftSec)}</strong>
+                <span>{scenario?.scenario.windowLabel ?? "06:00-07:00"}</span>
+              </div>
+              <input
+                type="range"
+                min={sumoWindowStartSec}
+                max={sumoWindowEndSec}
+                step={1}
+                value={sumoSeekDraftSec}
+                onChange={(event) => {
+                  setIsSumoScrubbing(true)
+                  setSumoSeekDraftSec(Number(event.target.value))
+                }}
+                onPointerDown={() => setIsSumoScrubbing(true)}
+                onPointerUp={(event) => commitSumoSeek(Number(event.currentTarget.value))}
+                onKeyUp={(event) => {
+                  if (
+                    event.key === "Enter" ||
+                    event.key === "ArrowLeft" ||
+                    event.key === "ArrowRight" ||
+                    event.key === "Home" ||
+                    event.key === "End"
+                  ) {
+                    commitSumoSeek(Number(event.currentTarget.value))
+                  }
+                }}
+                onBlur={(event) => {
+                  if (isSumoScrubbingRef.current) {
+                    commitSumoSeek(Number(event.currentTarget.value))
+                  }
+                }}
+                aria-label="Seek SUMO simulation time"
+              />
+              <div className="timeline-track" aria-hidden="true">
+                <span style={{ width: `${sumoProgressPercent}%` }} />
+              </div>
+            </div>
             <div className="delay-control">
               <div className="delay-control-header">
-                <span>Frame delay</span>
-                <strong>{sumoFrameDelayMs} ms</strong>
+                <span>Speed</span>
+                <strong>{sumoPlaybackSpeed}x</strong>
               </div>
               <input
                 type="range"
                 min={0}
-                max={1000}
-                step={5}
-                value={sumoFrameDelayMs}
-                disabled={isSumoRunning}
-                onChange={(event) => setSumoFrameDelayMs(Number(event.target.value))}
-                aria-label="SUMO frame delay milliseconds"
+                max={sumoSpeedOptions.length - 1}
+                step={1}
+                value={Math.max(0, sumoSpeedOptions.indexOf(sumoPlaybackSpeed))}
+                onChange={(event) => {
+                  const nextSpeed =
+                    sumoSpeedOptions[Number(event.target.value)] ?? sumoPlaybackSpeed
+                  setSumoSeekDraftSec(sumoFrame?.simSec ?? sumoSeekDraftSec)
+                  setSumoSeekSec(sumoFrame?.simSec ?? sumoSeekDraftSec)
+                  setSumoPlaybackSpeed(nextSpeed)
+                  if (isSumoRunning) {
+                    setSumoStatus("Changing speed")
+                    setSumoSessionKey((current) => current + 1)
+                  }
+                }}
+                aria-label="SUMO playback speed"
               />
               <div className="delay-options">
-                {sumoDelayOptions.map((option) => (
+                {sumoSpeedOptions.map((option) => (
                   <button
                     key={option}
                     type="button"
                     className={
-                      option === sumoFrameDelayMs ? "delay-option is-active" : "delay-option"
+                      option === sumoPlaybackSpeed ? "delay-option is-active" : "delay-option"
                     }
-                    disabled={isSumoRunning}
-                    onClick={() => setSumoFrameDelayMs(option)}
+                    onClick={() => {
+                      setSumoSeekDraftSec(sumoFrame?.simSec ?? sumoSeekDraftSec)
+                      setSumoSeekSec(sumoFrame?.simSec ?? sumoSeekDraftSec)
+                      setSumoPlaybackSpeed(option)
+                      if (isSumoRunning) {
+                        setSumoStatus("Changing speed")
+                        setSumoSessionKey((current) => current + 1)
+                      }
+                    }}
                   >
-                    {option}
+                    {option}x
                   </button>
                 ))}
               </div>
@@ -1200,6 +1744,7 @@ export default function App() {
                 className="icon-button"
                 disabled={isSumoRunning}
                 onClick={() => {
+                  commitSumoSeek()
                   setSumoFrame(null)
                   setIsSumoRunning(true)
                 }}
@@ -1264,10 +1809,8 @@ export default function App() {
             type="button"
             className="icon-button"
             onClick={() => {
-              setSumoFrame(null)
-              if (isSumoRunning) {
-                setSumoSessionKey((current) => current + 1)
-              } else {
+              commitSumoSeek()
+              if (!isSumoRunning) {
                 setIsSumoRunning(true)
               }
             }}
